@@ -4,7 +4,6 @@ import org.lwjgl.opengl.GL11.*
 import org.lwjgl.opengl.GL12.GL_CLAMP_TO_EDGE
 import org.lwjgl.opengl.GL13.GL_TEXTURE0
 import org.lwjgl.opengl.GL13.glActiveTexture
-import org.lwjgl.BufferUtils
 import java.util.concurrent.BlockingQueue
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
@@ -15,12 +14,12 @@ import kotlin.concurrent.withLock
 class VideoTextureDecoder(
     private val filePath: String,
     private val startTime: Double = 0.0,
-    private val maxBufferedFrames: Int = 2,
+    private val maxBufferedFrames: Int = 10,
     private val textureFiltering: Int = GL_LINEAR
-){
+) {
     private var textureIds = IntArray(2)
-
     private val currentTextureIndex = AtomicInteger(0)
+    private var hasNewFrame = AtomicBoolean(false)
 
     private var decoder: H264Decoder? = null
     private var isInitialized = AtomicBoolean(false)
@@ -31,64 +30,82 @@ class VideoTextureDecoder(
     private var videoHeight = 0
 
     private val frameQueue: BlockingQueue<Frame> = LinkedBlockingQueue(maxBufferedFrames)
-
     private val textureLock = ReentrantLock()
 
     private var duration: Double = 0.0
     private var currentTime: Double = 0.0
+    private var lastFrameTime: Double = -1.0
 
     fun initialize() {
         if (isInitialized.getAndSet(true)) return
 
-        decoder = H264Decoder(filePath, startTime, object : DecoderListener {
-            override fun onFrameDecoded(frame: Frame) {
-                if (!frameQueue.offer(frame)) {
-                    frameQueue.poll()
-                    frameQueue.offer(frame)
+        try {
+            val (width, height, videoDuration) = H264Decoder.getVideoInfo(filePath)
+            videoWidth = width
+            videoHeight = height
+            duration = videoDuration
+
+            if (videoWidth <= 0 || videoHeight <= 0) {
+                throw RuntimeException("Invalid video dimensions: ${videoWidth}x${videoHeight}")
+            }
+
+            println("Video dimensions: ${videoWidth}x${videoHeight}, duration: $duration")
+
+            initializeTextures()
+
+            decoder = H264Decoder(filePath, startTime, object : DecoderListener {
+                override fun onFrameDecoded(frame: Frame) {
+                    while (!frameQueue.offer(frame)) {
+                        frameQueue.poll()
+                    }
+                    hasNewFrame.set(true)
                 }
-            }
 
-            override fun onDecodingFinished() {
-                isPlaying.set(false)
-            }
+                override fun onDecodingFinished() {
+                    println("Декодирование завершено")
+                    isPlaying.set(false)
+                }
 
-            override fun onDecodingError(error: Exception) {
-                println("Ошибка декодирования: ${error.message}")
-                isPlaying.set(false)
-            }
-        })
+                override fun onDecodingError(error: Exception) {
+                    println("Ошибка декодирования: ${error.message}")
+                    error.printStackTrace()
+                    isPlaying.set(false)
+                }
+            })
 
-        val size = decoder?.getVideoSize() ?: Pair(0, 0)
-        videoWidth = size.first
-        videoHeight = size.second
-        duration = decoder?.getVideoDuration() ?: 0.0
+            isLoaded.set(true)
+            println("VideoTextureDecoder инициализирован успешно")
 
-        initializeTextures()
-
-        isLoaded.set(true)
+        } catch (e: Exception) {
+            println("Ошибка инициализации VideoTextureDecoder: ${e.message}")
+            e.printStackTrace()
+            isInitialized.set(false)
+            throw e
+        }
     }
 
     private fun initializeTextures() {
-        textureIds = IntArray(2) { glGenTextures() }
+        textureIds = IntArray(2)
+        for (i in textureIds.indices) {
+            textureIds[i] = glGenTextures()
+        }
 
         for (textureId in textureIds) {
             glBindTexture(GL_TEXTURE_2D, textureId)
 
-            // параметры текстуры
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, textureFiltering)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, textureFiltering)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
 
-
-            val emptyBuffer = BufferUtils.createByteBuffer(videoWidth * videoHeight * 3)
             glTexImage2D(
                 GL_TEXTURE_2D, 0, GL_RGB, videoWidth, videoHeight,
-                0, GL_RGB, GL_UNSIGNED_BYTE, emptyBuffer
+                0, GL_RGB, GL_UNSIGNED_BYTE, null as java.nio.ByteBuffer?
             )
         }
 
         glBindTexture(GL_TEXTURE_2D, 0)
+        println("Текстуры инициализированы: ${textureIds.contentToString()}")
     }
 
     fun play() {
@@ -97,12 +114,14 @@ class VideoTextureDecoder(
         }
 
         if (!isPlaying.getAndSet(true)) {
+            println("Запуск декодера...")
             decoder?.startAsync()
         }
     }
 
     fun stop() {
         if (isPlaying.getAndSet(false)) {
+            println("Остановка декодера...")
             decoder?.stop()
         }
     }
@@ -110,41 +129,76 @@ class VideoTextureDecoder(
     fun dispose() {
         stop()
 
-        for (textureId in textureIds) {
-            glDeleteTextures(textureId)
+        decoder?.join()
+
+        textureLock.withLock {
+            for (textureId in textureIds) {
+                if (textureId != 0) {
+                    glDeleteTextures(textureId)
+                }
+            }
         }
 
+        frameQueue.clear()
         isInitialized.set(false)
         isLoaded.set(false)
+        println("VideoTextureDecoder освобожден")
     }
 
     fun update(desiredTime: Double): Boolean {
-        if (!isPlaying.get() || frameQueue.isEmpty()) return false
-        val frame = frameQueue.peek() ?: return false
-        if (frame.timestamp <= desiredTime) {
+        if (!isPlaying.get()) return false
+
+        var frameUpdated = false
+
+        while (true) {
+            val frame = frameQueue.peek() ?: break
+
+            if (frame.timestamp > desiredTime + 0.033) {
+                break
+            }
+
             frameQueue.poll()
+
+            updateTexture(frame)
+            currentTime = frame.timestamp
+            lastFrameTime = frame.timestamp
+            frameUpdated = true
+
+            if (kotlin.math.abs(frame.timestamp - desiredTime) < 0.1) {
+                break
+            }
+        }
+
+        return frameUpdated
+    }
+
+    private fun updateTexture(frame: Frame) {
+        try {
             val nextTextureIndex = (currentTextureIndex.get() + 1) % 2
             val textureId = textureIds[nextTextureIndex]
+
             textureLock.withLock {
                 glBindTexture(GL_TEXTURE_2D, textureId)
-                val buffer = frame.buffer
-                buffer.position(0)
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, frame.width, frame.height, 0, GL_RGB, GL_UNSIGNED_BYTE, buffer)
+
+                frame.buffer.position(0)
+
+                glTexSubImage2D(
+                    GL_TEXTURE_2D, 0, 0, 0,
+                    frame.width, frame.height,
+                    GL_RGB, GL_UNSIGNED_BYTE, frame.buffer
+                )
+
                 glBindTexture(GL_TEXTURE_2D, 0)
+
                 currentTextureIndex.set(nextTextureIndex)
+                hasNewFrame.set(false)
             }
-            currentTime = frame.timestamp
-            return true
+        } catch (e: Exception) {
+            println("Ошибка обновления текстуры: ${e.message}")
+            e.printStackTrace()
         }
-        return false
     }
-    /**
-     * Привязать текущую текстуру к указанному текстурному юниту.
-     * Этот метод должен вызываться в потоке рендеринга OpenGL.
-     *
-     * @param textureUnit текстурный юнит (по умолчанию GL_TEXTURE0)
-     * @return ID текстуры, которая была привязана
-     */
+
     fun bindTexture(textureUnit: Int = GL_TEXTURE0): Int {
         glActiveTexture(textureUnit)
         val textureId = textureIds[currentTextureIndex.get()]
@@ -152,45 +206,19 @@ class VideoTextureDecoder(
         return textureId
     }
 
-    /**
-     * Проверяет, доступен ли новый кадр видео.
-     *
-     * @return true, если новый кадр доступен, false - если нет
-     */
     fun isFrameAvailable(): Boolean {
-        return !frameQueue.isEmpty()
+        return !frameQueue.isEmpty() || hasNewFrame.get()
     }
 
-    /**
-     * Отвязать текстуру
-     */
     fun unbindTexture() {
         glBindTexture(GL_TEXTURE_2D, 0)
     }
 
-    /**
-     * Получить длительность видео в секундах
-     */
     fun getDuration(): Double = duration
-
-    /**
-     * Получить текущее время воспроизведения в секундах
-     */
     fun getCurrentTime(): Double = currentTime
-
-    /**
-     * Получить размеры видео
-     */
     fun getVideoSize(): Pair<Int, Int> = Pair(videoWidth, videoHeight)
-
-    /**
-     * Проверить, загружено ли видео
-     */
     fun isLoaded(): Boolean = isLoaded.get()
-
-    /**
-     * Проверить, воспроизводится ли видео
-     */
     fun isPlaying(): Boolean = isPlaying.get()
-
+    fun getQueueSize(): Int = frameQueue.size
+    fun getLastFrameTime(): Double = lastFrameTime
 }
