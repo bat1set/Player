@@ -1,14 +1,18 @@
 package main
 
+import java.nio.file.Files
+import java.nio.file.Path
 import java.nio.ByteBuffer
 
 data class PlayerOptions(
     val filePath: String,
     val cacheEnabled: Boolean = true,
-    val cacheDir: java.nio.file.Path = defaultCacheDir(),
+    val cacheDir: Path = defaultCacheDir(),
     val cacheSizeMb: Long = 512,
     val audioDevice: String = "default",
-    val nativeYuv: Boolean = false
+    val nativeYuv: Boolean = false,
+    val debugSync: Boolean = false,
+    val debugVideo: Boolean = false
 )
 
 data class VideoInfo(
@@ -78,8 +82,26 @@ data class AudioChunk(
     override fun close() = release(pcm)
 }
 
-fun defaultCacheDir(): java.nio.file.Path {
-    return java.nio.file.Path.of(System.getProperty("user.dir"), ".player-cache")
+fun defaultCacheDir(): Path {
+    return defaultCacheDir(Path.of(System.getProperty("user.dir")))
+}
+
+fun defaultCacheDir(workingDir: Path): Path {
+    val normalized = workingDir.toAbsolutePath().normalize()
+    val buildDir = normalized.parent
+    val projectCandidate = buildDir?.parent
+    val projectRoot = if (
+        normalized.fileName?.toString() == "libs" &&
+        buildDir?.fileName?.toString() == "build" &&
+        projectCandidate != null &&
+        (Files.exists(projectCandidate.resolve("settings.gradle.kts")) ||
+            Files.exists(projectCandidate.resolve("build.gradle.kts")))
+    ) {
+        projectCandidate
+    } else {
+        normalized
+    }
+    return projectRoot.resolve(".player-cache")
 }
 
 fun printUsage() {
@@ -93,6 +115,8 @@ fun printUsage() {
           --cache-size-mb <n>     Limit disk cache size in megabytes. Default: 512.
           --audio-device default  Use the default OpenAL output device.
           --native-yuv            Use experimental YUV shader upload instead of RGB fallback.
+          --debug-sync            Log audio/video clock drift and queue sizes.
+          --debug-video           Log decoded frame and pixel format diagnostics.
           --help                  Show this help.
         """.trimIndent()
     )
@@ -109,6 +133,8 @@ fun parsePlayerOptions(args: Array<String>): PlayerOptions? {
     var cacheSizeMb = 512L
     var audioDevice = "default"
     var nativeYuv = false
+    var debugSync = false
+    var debugVideo = false
     var filePath: String? = null
 
     var i = 0
@@ -116,6 +142,8 @@ fun parsePlayerOptions(args: Array<String>): PlayerOptions? {
         when (val arg = args[i]) {
             "--no-cache" -> cacheEnabled = false
             "--native-yuv" -> nativeYuv = true
+            "--debug-sync" -> debugSync = true
+            "--debug-video" -> debugVideo = true
             "--cache-dir" -> {
                 i++
                 if (i >= args.size) {
@@ -123,7 +151,7 @@ fun parsePlayerOptions(args: Array<String>): PlayerOptions? {
                     printUsage()
                     return null
                 }
-                cacheDir = java.nio.file.Path.of(args[i])
+                cacheDir = Path.of(args[i])
             }
             "--cache-size-mb" -> {
                 i++
@@ -171,6 +199,8 @@ fun parsePlayerOptions(args: Array<String>): PlayerOptions? {
         cacheDir = cacheDir,
         cacheSizeMb = cacheSizeMb,
         audioDevice = audioDevice,
-        nativeYuv = nativeYuv
+        nativeYuv = nativeYuv,
+        debugSync = debugSync,
+        debugVideo = debugVideo
     )
 }

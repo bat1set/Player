@@ -2,6 +2,7 @@ package main
 
 import org.lwjgl.BufferUtils
 import org.lwjgl.glfw.GLFW.GLFW_KEY_DOWN
+import org.lwjgl.glfw.GLFW.GLFW_KEY_D
 import org.lwjgl.glfw.GLFW.GLFW_KEY_F
 import org.lwjgl.glfw.GLFW.GLFW_KEY_LEFT
 import org.lwjgl.glfw.GLFW.GLFW_KEY_R
@@ -75,16 +76,22 @@ class VideoPlayer(private val options: PlayerOptions) {
     private var audioDecoder: FFmpegAudioDecoder? = null
     private val decoderGeneration = AtomicInteger(0)
     private val isSeekInProgress = AtomicBoolean(false)
+    private val playback = PlaybackStateController()
 
     private val info = FFmpegVideoDecoder.readVideoInfo(options.filePath)
     private val totalDuration = info.duration
     private val fallbackClock = PlaybackClock()
 
-    private var paused = false
     private var playbackSpeed = 1.0
     private var currentTime = 0.0
     private var lastFrameTimestamp = -1.0
     private var showFps = false
+    private var debugOverlayVisible = false
+    private var droppedLateFrames = 0
+    private var lastAudioClock = 0.0
+    private var lastAvDrift = 0.0
+    private var lastSyncDebugLogTime = 0.0
+    private var bufferingStartedNanos = System.nanoTime()
 
     private var fps = 0.0
     private var frameCount = 0
@@ -96,6 +103,7 @@ class VideoPlayer(private val options: PlayerOptions) {
     private var timelineLastInteraction = 0.0
     private val timelineTimeout = 3.0
     private var timelineMouseWasPressed = false
+    private val paused: Boolean get() = playback.state == PlaybackState.PAUSED
 
     fun run() {
         Log.info("Starting player")
@@ -109,14 +117,15 @@ class VideoPlayer(private val options: PlayerOptions) {
         )
         Log.info("Cache: enabled=${options.cacheEnabled}, dir=${options.cacheDir.toAbsolutePath()}, limit=${options.cacheSizeMb}MB")
         Log.info("Video output mode: ${if (options.nativeYuv) "native YUV shader (experimental)" else "RGB fallback"}")
+        Log.info("Diagnostics: debugSync=${options.debugSync}, debugVideo=${options.debugVideo}")
         initGLFW()
         initOpenGL()
         initCache()
         initAudio()
+        beginBuffering(0.0, playWhenReady = true, reason = "startup")
         startDecoders(0.0)
         preloadFirstFrame()
-        fallbackClock.reset(0.0, paused, playbackSpeed)
-        currentTime = 0.0
+        lastLoopTime = System.nanoTime() / 1_000_000_000.0
         loop()
         cleanup()
     }
@@ -167,6 +176,7 @@ class VideoPlayer(private val options: PlayerOptions) {
         val generation = decoderGeneration.incrementAndGet()
         lastFrameTimestamp = seekTime
         Log.info("Starting decoders at %.3fs (generation %d)".format(seekTime, generation))
+        logSelectedSegment(seekTime)
 
         videoDecoder = FFmpegVideoDecoder(
             filePath = options.filePath,
@@ -187,7 +197,8 @@ class VideoPlayer(private val options: PlayerOptions) {
                 }
             },
             bufferPool = videoBufferPool,
-            nativeYuv = options.nativeYuv
+            nativeYuv = options.nativeYuv,
+            debugVideo = options.debugVideo
         ).also { it.startAsync() }
 
         if (info.hasAudio && audioDevice != null) {
@@ -196,19 +207,19 @@ class VideoPlayer(private val options: PlayerOptions) {
                 startTime = seekTime,
                 listener = object : AudioDecoderListener {
                     override fun onAudioDecoded(chunk: AudioChunk) {
-                    if (generation != decoderGeneration.get()) {
-                        chunk.close()
-                        return
+                        if (generation != decoderGeneration.get()) {
+                            chunk.close()
+                            return
+                        }
+                        offerAudioChunk(chunk, generation)
                     }
-                    offerAudioChunk(chunk, generation)
-                }
 
-                override fun onAudioFinished() = Unit
+                    override fun onAudioFinished() = Unit
 
-                override fun onAudioError(error: Exception) {
-                    Log.error("Audio decode error: ${error.message}", error)
-                }
-            },
+                    override fun onAudioError(error: Exception) {
+                        Log.error("Audio decode error: ${error.message}", error)
+                    }
+                },
                 bufferPool = audioBufferPool
             ).also { it.startAsync() }
         }
@@ -217,19 +228,18 @@ class VideoPlayer(private val options: PlayerOptions) {
     }
 
     private fun preloadFirstFrame(timeoutMillis: Long = 5_000) {
+        val startedAt = System.nanoTime()
         val deadline = System.nanoTime() + timeoutMillis * 1_000_000L
         Log.info("Waiting for first decoded video frame")
         while (System.nanoTime() < deadline) {
             val frame = videoQueue.poll(25, TimeUnit.MILLISECONDS)
             if (frame != null) {
-                currentTime = frame.timestamp
-                lastFrameTimestamp = frame.timestamp
-                renderer.upload(frame)
-                Log.info("First video frame ready at %.3fs".format(currentTime))
+                completeBufferedFrame(frame, "startup", startedAt)
                 return
             }
         }
         Log.info("First video frame was not ready after ${timeoutMillis}ms; starting playback anyway")
+        finishBufferingWithoutFrame("startup timeout")
     }
 
     private fun stopDecoders() {
@@ -282,9 +292,18 @@ class VideoPlayer(private val options: PlayerOptions) {
         if (isSeekInProgress.getAndSet(true)) return
         val clamped = targetTime.coerceIn(0.0, totalDuration.takeIf { it > 0.0 } ?: targetTime)
         currentTime = clamped
-        fallbackClock.reset(clamped, paused, playbackSpeed)
+        val shouldResume = playback.playWhenReady && playback.state != PlaybackState.PAUSED
+        beginSeek(clamped, playWhenReady = shouldResume, reason = "user/request")
+        fallbackClock.reset(clamped, paused = true, playbackSpeed)
         decoderGeneration.incrementAndGet()
-        Log.info("Seek requested: %.3fs".format(clamped))
+        Log.info(
+            "Seek requested: target=%.3fs, selectedSegment=%.3fs, resume=%s".format(
+                clamped,
+                selectedSegmentStart(clamped),
+                shouldResume
+            )
+        )
+        audioDevice?.setPaused(true)
         audioDevice?.clear(clamped)
         closeQueuedFrames()
         closeQueuedAudio()
@@ -312,8 +331,10 @@ class VideoPlayer(private val options: PlayerOptions) {
             lastLoopTime = loopTime
 
             processInput(loopTime)
+            handleBufferedFrameIfNeeded()
             pumpAudio()
             updateClock(loopTime)
+            logSyncDiagnostics(loopTime)
             updateFps(deltaTime)
 
             if (loopTime - timelineLastInteraction > timelineTimeout) {
@@ -327,7 +348,7 @@ class VideoPlayer(private val options: PlayerOptions) {
             glfwSwapBuffers(window)
             glfwPollEvents()
 
-            if (!paused && !isSeekInProgress.get() && videoQueue.isEmpty() && currentTime < totalDuration - 1.0) {
+            if (playback.state == PlaybackState.PLAYING && videoQueue.isEmpty() && currentTime < totalDuration - 1.0) {
                 noFramesCounter += deltaTime
                 if (noFramesCounter > 4.0) {
                     Log.info("Decoder stalled; restarting near %.2f seconds".format(currentTime))
@@ -339,7 +360,7 @@ class VideoPlayer(private val options: PlayerOptions) {
             }
 
             if (totalDuration > 0.0 && currentTime >= totalDuration) {
-                setPaused(true)
+                markEnded("duration reached")
             }
 
             if (!frameUpdated) {
@@ -349,6 +370,10 @@ class VideoPlayer(private val options: PlayerOptions) {
     }
 
     private fun pumpAudio() {
+        if (!playback.canPumpAudio()) {
+            audioDevice?.setPaused(true)
+            return
+        }
         val device = audioDevice ?: return
         device.pump()
 
@@ -370,18 +395,34 @@ class VideoPlayer(private val options: PlayerOptions) {
     }
 
     private fun updateClock(loopTime: Double) {
-        currentTime = if (!paused && audioDevice != null && info.hasAudio) {
-            audioDevice?.clockSeconds(currentTime) ?: fallbackClock.seconds(loopTime)
+        if (!playback.canAdvanceClock()) {
+            return
+        }
+
+        currentTime = if (audioDevice != null && info.hasAudio) {
+            val audioClock = audioDevice?.clockSeconds(currentTime) ?: fallbackClock.seconds(loopTime)
+            lastAudioClock = audioClock
+            audioClock
         } else {
             fallbackClock.seconds(loopTime)
         }
+        lastAvDrift = lastFrameTimestamp - currentTime
         segmentIndex?.let { segmentCache?.prefetchAround(it, currentTime) }
     }
 
     private fun uploadDueFrames(): Boolean {
+        if (playback.isWaitingForFirstFrame()) {
+            return false
+        }
+
         var uploaded = false
         while (true) {
             val frame = videoQueue.peek() ?: break
+            if (videoQueue.size > 1 && frame.timestamp < currentTime - 0.100) {
+                videoQueue.poll()?.close()
+                droppedLateFrames++
+                continue
+            }
             if (frame.timestamp > currentTime + 0.025) break
             val due = videoQueue.poll() ?: break
             lastFrameTimestamp = due.timestamp
@@ -420,6 +461,9 @@ class VideoPlayer(private val options: PlayerOptions) {
         if (pressedOnce(GLFW_KEY_F)) {
             showFps = !showFps
         }
+        if (pressedOnce(GLFW_KEY_D)) {
+            debugOverlayVisible = !debugOverlayVisible
+        }
         if (pressedOnce(GLFW_KEY_R)) {
             requestSeek(0.0)
         }
@@ -434,10 +478,16 @@ class VideoPlayer(private val options: PlayerOptions) {
     }
 
     private fun setPaused(value: Boolean) {
-        if (paused == value) return
-        paused = value
-        fallbackClock.reset(currentTime, paused, playbackSpeed)
-        audioDevice?.setPaused(paused)
+        val before = playback.state
+        if (value) {
+            playback.pause()
+            audioDevice?.setPaused(true)
+        } else {
+            playback.play()
+            fallbackClock.reset(currentTime, paused = false, playbackSpeed)
+            audioDevice?.setPaused(playback.state != PlaybackState.PLAYING)
+        }
+        logStateChange(before, playback.state, if (value) "pause requested" else "play requested")
     }
 
     private fun setPlaybackSpeed(value: Double) {
@@ -476,6 +526,145 @@ class VideoPlayer(private val options: PlayerOptions) {
         }
     }
 
+    private fun beginBuffering(targetTime: Double, playWhenReady: Boolean, reason: String) {
+        val before = playback.state
+        bufferingStartedNanos = System.nanoTime()
+        playback.startBuffering(targetTime, playWhenReady)
+        currentTime = targetTime
+        fallbackClock.reset(targetTime, paused = true, playbackSpeed)
+        audioDevice?.setPaused(true)
+        logStateChange(before, playback.state, reason)
+    }
+
+    private fun beginSeek(targetTime: Double, playWhenReady: Boolean, reason: String) {
+        val before = playback.state
+        bufferingStartedNanos = System.nanoTime()
+        playback.startSeek(targetTime, playWhenReady)
+        logStateChange(before, playback.state, reason)
+    }
+
+    private fun handleBufferedFrameIfNeeded() {
+        if (!playback.isWaitingForFirstFrame()) return
+        val frame = videoQueue.poll()
+        if (frame == null) {
+            val waitedMs = (System.nanoTime() - bufferingStartedNanos) / 1_000_000L
+            if (waitedMs > 5_000) {
+                Log.info("No video frame arrived while ${playback.state} after ${waitedMs}ms")
+                finishBufferingWithoutFrame("${playback.state.name.lowercase()} timeout")
+            }
+            return
+        }
+        completeBufferedFrame(frame, playback.state.name.lowercase(), bufferingStartedNanos)
+    }
+
+    private fun completeBufferedFrame(frame: VideoFrame, reason: String, startedAtNanos: Long) {
+        currentTime = frame.timestamp
+        lastFrameTimestamp = frame.timestamp
+        renderer.upload(frame)
+        val waitMs = (System.nanoTime() - startedAtNanos) / 1_000_000.0
+        val before = playback.state
+        val after = playback.firstFrameReady()
+        fallbackClock.reset(currentTime, paused = after != PlaybackState.PLAYING, playbackSpeed)
+        dropAudioBefore(currentTime - 0.020)
+        audioDevice?.clear(currentTime)
+        audioDevice?.setPaused(after != PlaybackState.PLAYING)
+        isSeekInProgress.set(false)
+        Log.info(
+            "First video frame ready after %s: frame=%.3fs, target=%.3fs, wait=%.1fms".format(
+                reason,
+                currentTime,
+                playback.targetTime,
+                waitMs
+            )
+        )
+        logStateChange(before, after, "first frame ready")
+    }
+
+    private fun finishBufferingWithoutFrame(reason: String) {
+        val before = playback.state
+        val after = playback.firstFrameReady()
+        fallbackClock.reset(currentTime, paused = after != PlaybackState.PLAYING, playbackSpeed)
+        audioDevice?.setPaused(after != PlaybackState.PLAYING)
+        isSeekInProgress.set(false)
+        logStateChange(before, after, reason)
+    }
+
+    private fun markEnded(reason: String) {
+        if (playback.state == PlaybackState.ENDED) return
+        val before = playback.state
+        playback.end()
+        currentTime = totalDuration
+        audioDevice?.setPaused(true)
+        logStateChange(before, playback.state, reason)
+    }
+
+    private fun dropAudioBefore(timeSeconds: Double) {
+        var dropped = 0
+        while (true) {
+            val chunk = audioQueue.peek() ?: break
+            if (chunk.timestamp + chunk.duration >= timeSeconds) break
+            audioQueue.poll()?.close()
+            dropped++
+        }
+        if (dropped > 0) {
+            Log.info("Dropped $dropped stale audio chunks before %.3fs".format(timeSeconds))
+        }
+    }
+
+    private fun selectedSegmentStart(timeSeconds: Double): Double {
+        return segmentIndex?.findSegmentStart(timeSeconds) ?: 0.0
+    }
+
+    private fun logSelectedSegment(timeSeconds: Double) {
+        val index = segmentIndex ?: return
+        val start = index.findSegmentStart(timeSeconds)
+        val next = index.nextSegmentStart(start)
+        Log.info(
+            "Segment selected: target=%.3fs, segmentStart=%.3fs, next=%s".format(
+                timeSeconds,
+                start,
+                next?.let { "%.3fs".format(it) } ?: "none"
+            )
+        )
+    }
+
+    private fun logStateChange(before: PlaybackState, after: PlaybackState, reason: String) {
+        if (before != after) {
+            Log.info("Playback state: $before -> $after ($reason)")
+        } else if (options.debugSync) {
+            Log.info("Playback state unchanged: $after ($reason)")
+        }
+    }
+
+    private fun logSyncDiagnostics(loopTime: Double) {
+        if (!options.debugSync || loopTime - lastSyncDebugLogTime < 1.0) return
+        lastSyncDebugLogTime = loopTime
+        Log.info(
+            "Sync: state=%s time=%.3fs video=%.3fs audio=%.3fs drift=%.3fs vq=%d aq=%d dropped=%d".format(
+                playback.state,
+                currentTime,
+                lastFrameTimestamp,
+                lastAudioClock,
+                lastAvDrift,
+                videoQueue.size,
+                audioQueue.size,
+                droppedLateFrames
+            )
+        )
+    }
+
+    private fun debugOverlayText(): String {
+        return "state: %s   vq: %d   aq: %d   drift: %.3fs   video: %.3fs   audio: %.3fs   dropped: %d".format(
+            playback.state,
+            videoQueue.size,
+            audioQueue.size,
+            lastAvDrift,
+            lastFrameTimestamp,
+            lastAudioClock,
+            droppedLateFrames
+        )
+    }
+
     private fun renderOverlay() {
         glMatrixMode(GL_PROJECTION)
         glPushMatrix()
@@ -487,11 +676,7 @@ class VideoPlayer(private val options: PlayerOptions) {
 
         val cacheText = if (options.cacheEnabled && segmentIndex != null) "cache:on" else "cache:off"
         val audioText = if (audioDevice != null && info.hasAudio) "audio:on" else "audio:off"
-        val statusText = when {
-            isSeekInProgress.get() -> "seeking"
-            paused -> "paused"
-            else -> "playing"
-        }
+        val statusText = playback.state.name.lowercase()
         val fpsText = if (showFps) " FPS: %.2f".format(fps) else ""
         val overlayText = "time: %.2f / %.2f sec   speed: %.2fx   %s   %s   %s%s".format(
             currentTime,
@@ -503,6 +688,9 @@ class VideoPlayer(private val options: PlayerOptions) {
             fpsText
         )
         drawText(overlayText, 10f, 30f)
+        if (debugOverlayVisible || options.debugSync) {
+            drawText(debugOverlayText(), 10f, 48f)
+        }
 
         if (timelineVisible) {
             renderTimeline()

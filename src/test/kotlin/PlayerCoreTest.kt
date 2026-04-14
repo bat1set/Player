@@ -2,9 +2,12 @@ package main
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 import java.nio.file.Files
+import java.nio.file.Path
 
 class PlayerCoreTest {
     @Test
@@ -53,5 +56,51 @@ class PlayerCoreTest {
     fun cliRequiresVideoPath() {
         assertNull(parsePlayerOptions(emptyArray()))
         assertNull(parsePlayerOptions(arrayOf("--cache-dir")))
+    }
+
+    @Test
+    fun cliParsesDebugFlags() {
+        val options = parsePlayerOptions(
+            arrayOf("--debug-sync", "--debug-video", "--native-yuv", "video.mp4")
+        )!!
+
+        assertTrue(options.debugSync)
+        assertTrue(options.debugVideo)
+        assertTrue(options.nativeYuv)
+    }
+
+    @Test
+    fun defaultCacheDirMovesFromBuildLibsToProjectRoot() {
+        val root = Files.createTempDirectory("player-project")
+        Files.writeString(root.resolve("settings.gradle.kts"), "rootProject.name = \"test\"")
+        val libs = Files.createDirectories(root.resolve(Path.of("build", "libs")))
+
+        assertEquals(root.resolve(".player-cache"), defaultCacheDir(libs))
+    }
+
+    @Test
+    fun playbackStateBuffersSeeksAndResumesAfterFirstFrame() {
+        val state = PlaybackStateController()
+
+        assertEquals(PlaybackState.BUFFERING, state.state)
+        assertTrue(state.canPumpAudio().not())
+
+        state.firstFrameReady()
+        assertEquals(PlaybackState.PLAYING, state.state)
+        assertTrue(state.canPumpAudio())
+
+        state.startSeek(4.0, playWhenReady = true)
+        assertEquals(PlaybackState.SEEKING, state.state)
+        assertFalse(state.canPumpAudio())
+        assertEquals(4.0, state.targetTime)
+
+        state.firstFrameReady()
+        assertEquals(PlaybackState.PLAYING, state.state)
+
+        state.pause()
+        state.startSeek(1.0, playWhenReady = state.playWhenReady)
+        state.firstFrameReady()
+        assertEquals(PlaybackState.PAUSED, state.state)
+        assertFalse(state.canPumpAudio())
     }
 }

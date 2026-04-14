@@ -56,12 +56,14 @@ class FFmpegVideoDecoder(
     private val startTime: Double = 0.0,
     private val listener: DecoderListener? = null,
     private val bufferPool: ByteBufferPool = ByteBufferPool(),
-    private val nativeYuv: Boolean = false
+    private val nativeYuv: Boolean = false,
+    private val debugVideo: Boolean = false
 ) {
     @Volatile private var shouldStop = false
     @Volatile private var isDecoding = false
     private var frameCallback: ((VideoFrame) -> Unit)? = null
     private var decoderThread: Thread? = null
+    private var firstFrameDebugLogged = false
 
     private val info = readVideoInfo(filePath)
 
@@ -190,6 +192,7 @@ class FFmpegVideoDecoder(
                 }
                 else -> copyRgbFallbackFrame(decoded, rgb, swsCtx, rgbBuffer, timestamp)
             }
+            logFirstFrameDebug(frame, codecCtx.pix_fmt(), decoded)
             emitFrame(frame)
         }
     }
@@ -257,6 +260,56 @@ class FFmpegVideoDecoder(
             frame.close()
             throw e
         }
+    }
+
+    private fun logFirstFrameDebug(
+        frame: VideoFrame,
+        pixelFormat: Int,
+        decoded: org.bytedeco.ffmpeg.avutil.AVFrame
+    ) {
+        if (!debugVideo || firstFrameDebugLogged) return
+        firstFrameDebugLogged = true
+        Log.info(
+            "First decoded video frame: type=${frame::class.simpleName}, " +
+                "format=${pixelFormatName(pixelFormat)}, timestamp=%.3fs, size=%dx%d, linesize=[%d,%d,%d]".format(
+                    frame.timestamp,
+                    frame.width,
+                    frame.height,
+                    decoded.linesize(0),
+                    decoded.linesize(1),
+                    decoded.linesize(2)
+                )
+        )
+        when (frame) {
+            is RgbVideoFrame -> Log.info("RGB sample: ${bufferStats(frame.rgb)}")
+            is Yuv420pVideoFrame -> {
+                Log.info("Y plane sample: ${bufferStats(frame.y)}")
+                Log.info("U plane sample: ${bufferStats(frame.u)}")
+                Log.info("V plane sample: ${bufferStats(frame.v)}")
+            }
+            is Nv12VideoFrame -> {
+                Log.info("Y plane sample: ${bufferStats(frame.y)}")
+                Log.info("UV plane sample: ${bufferStats(frame.uv)}")
+            }
+        }
+    }
+
+    private fun bufferStats(buffer: java.nio.ByteBuffer, sampleSize: Int = 4096): String {
+        val duplicate = buffer.asReadOnlyBuffer()
+        duplicate.position(0)
+        val count = minOf(sampleSize, duplicate.remaining())
+        if (count <= 0) return "empty"
+        var min = 255
+        var max = 0
+        var sum = 0L
+        repeat(count) {
+            val value = duplicate.get().toInt() and 0xff
+            if (value < min) min = value
+            if (value > max) max = value
+            sum += value
+        }
+        val avg = sum.toDouble() / count
+        return "sample=$count min=$min max=$max avg=%.2f".format(avg)
     }
 
     private fun copyPlane(
