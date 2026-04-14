@@ -41,8 +41,9 @@ kotlin {
 }
 
 tasks.shadowJar {
-    archiveBaseName.set("h264-decoder")
+    archiveBaseName.set("decoder")
     archiveVersion.set("1.0.0")
+    archiveClassifier.set("")
     mergeServiceFiles()
 
     // Оптимизации для уменьшения размера
