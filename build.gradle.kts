@@ -1,7 +1,7 @@
 plugins {
-    kotlin("jvm") version "2.1.10"
+    kotlin("jvm") version "2.3.20"
     application
-    id("com.github.johnrengelman.shadow") version "8.1.1"
+    id("com.gradleup.shadow") version "9.4.1"
 }
 
 repositories {
@@ -9,38 +9,27 @@ repositories {
 }
 
 dependencies {
-    val lwjglVersion = "3.3.2"
+    val lwjglVersion = "3.4.1"
     val lwjglNatives = "natives-windows"
 
     implementation("org.lwjgl:lwjgl:$lwjglVersion")
     implementation("org.lwjgl:lwjgl-opengl:$lwjglVersion")
     implementation("org.lwjgl:lwjgl-glfw:$lwjglVersion")
     implementation("org.lwjgl:lwjgl-stb:$lwjglVersion")
+    implementation("org.lwjgl:lwjgl-openal:$lwjglVersion")
 
     runtimeOnly("org.lwjgl:lwjgl::$lwjglNatives")
     runtimeOnly("org.lwjgl:lwjgl-opengl::$lwjglNatives")
     runtimeOnly("org.lwjgl:lwjgl-glfw::$lwjglNatives")
     runtimeOnly("org.lwjgl:lwjgl-stb::$lwjglNatives")
+    runtimeOnly("org.lwjgl:lwjgl-openal::$lwjglNatives")
 
-    val javacvVersion = "1.5.8"
+    val ffmpegPresetVersion = "8.0.1-1.5.13"
 
-    // Основные компоненты JavaCV
-    implementation("org.bytedeco:javacv:$javacvVersion") {
-        exclude(group = "org.bytedeco", module = "ffmpeg-platform")
-        exclude(group = "org.bytedeco", module = "flycapture")
-        exclude(group = "org.bytedeco", module = "libdc1394")
-        exclude(group = "org.bytedeco", module = "opencv")
-        exclude(group = "org.bytedeco", module = "openkinect")
-        exclude(group = "org.bytedeco", module = "videoinput")
-        exclude(group = "org.bytedeco", module = "artoolkitplus")
-        exclude(group = "org.bytedeco", module = "librealsense")
-        exclude(group = "org.bytedeco", module = "librealsense2")
-        exclude(group = "org.bytedeco", module = "flandmark")
-    }
+    implementation("org.bytedeco:ffmpeg:$ffmpegPresetVersion")
+    runtimeOnly("org.bytedeco:ffmpeg:$ffmpegPresetVersion:windows-x86_64")
 
-    // Только FFmpeg для Windows x64
-    implementation("org.bytedeco:ffmpeg:5.1.2-$javacvVersion")
-    runtimeOnly("org.bytedeco:ffmpeg:5.1.2-$javacvVersion:windows-x86_64")
+    testImplementation(kotlin("test-junit5"))
 }
 
 application {
@@ -64,4 +53,8 @@ tasks.shadowJar {
 
 tasks.build {
     dependsOn(tasks.shadowJar)
+}
+
+tasks.test {
+    useJUnitPlatform()
 }

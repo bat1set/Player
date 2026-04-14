@@ -1,72 +1,129 @@
 package main
 
 import org.lwjgl.BufferUtils
-import org.lwjgl.glfw.GLFW.*
+import org.lwjgl.glfw.GLFW.GLFW_KEY_DOWN
+import org.lwjgl.glfw.GLFW.GLFW_KEY_F
+import org.lwjgl.glfw.GLFW.GLFW_KEY_LEFT
+import org.lwjgl.glfw.GLFW.GLFW_KEY_R
+import org.lwjgl.glfw.GLFW.GLFW_KEY_RIGHT
+import org.lwjgl.glfw.GLFW.GLFW_KEY_SPACE
+import org.lwjgl.glfw.GLFW.GLFW_KEY_UP
+import org.lwjgl.glfw.GLFW.GLFW_MOUSE_BUTTON_LEFT
+import org.lwjgl.glfw.GLFW.GLFW_PRESS
+import org.lwjgl.glfw.GLFW.glfwCreateWindow
+import org.lwjgl.glfw.GLFW.glfwDestroyWindow
+import org.lwjgl.glfw.GLFW.glfwGetCursorPos
+import org.lwjgl.glfw.GLFW.glfwGetKey
+import org.lwjgl.glfw.GLFW.glfwGetMouseButton
+import org.lwjgl.glfw.GLFW.glfwInit
+import org.lwjgl.glfw.GLFW.glfwMakeContextCurrent
+import org.lwjgl.glfw.GLFW.glfwPollEvents
+import org.lwjgl.glfw.GLFW.glfwSwapBuffers
+import org.lwjgl.glfw.GLFW.glfwSwapInterval
+import org.lwjgl.glfw.GLFW.glfwTerminate
+import org.lwjgl.glfw.GLFW.glfwWindowShouldClose
 import org.lwjgl.opengl.GL
-import org.lwjgl.opengl.GL11.*
+import org.lwjgl.opengl.GL11.GL_BLEND
+import org.lwjgl.opengl.GL11.GL_FLOAT
+import org.lwjgl.opengl.GL11.GL_MODELVIEW
+import org.lwjgl.opengl.GL11.GL_ONE_MINUS_SRC_ALPHA
+import org.lwjgl.opengl.GL11.GL_PROJECTION
+import org.lwjgl.opengl.GL11.GL_QUADS
+import org.lwjgl.opengl.GL11.GL_SRC_ALPHA
+import org.lwjgl.opengl.GL11.GL_VERTEX_ARRAY
+import org.lwjgl.opengl.GL11.glBegin
+import org.lwjgl.opengl.GL11.glBlendFunc
+import org.lwjgl.opengl.GL11.glColor3f
+import org.lwjgl.opengl.GL11.glDisable
+import org.lwjgl.opengl.GL11.glDisableClientState
+import org.lwjgl.opengl.GL11.glDrawArrays
+import org.lwjgl.opengl.GL11.glEnable
+import org.lwjgl.opengl.GL11.glEnableClientState
+import org.lwjgl.opengl.GL11.glEnd
+import org.lwjgl.opengl.GL11.glLoadIdentity
+import org.lwjgl.opengl.GL11.glMatrixMode
+import org.lwjgl.opengl.GL11.glOrtho
+import org.lwjgl.opengl.GL11.glPopMatrix
+import org.lwjgl.opengl.GL11.glPushMatrix
+import org.lwjgl.opengl.GL11.glVertex2d
+import org.lwjgl.opengl.GL11.glVertexPointer
 import org.lwjgl.stb.STBEasyFont
 import org.lwjgl.system.MemoryUtil.NULL
-import java.nio.ByteBuffer
 import java.nio.DoubleBuffer
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.max
+import kotlin.math.min
 
-class VideoPlayer(private val filePath: String) {
+class VideoPlayer(private val options: PlayerOptions) {
     private var window: Long = NULL
-    private var textureID = 0
-    // Очередь для кадров из декодера
-    private val frameQueue = ConcurrentLinkedQueue<Frame>()
+    private val renderer = VideoFrameRenderer()
+    private var audioDevice: OpenALAudioDevice? = null
+    private var segmentCache: VideoSegmentCache? = null
+    private var segmentIndex: SegmentIndex? = null
 
-    // Управление воспроизведением
+    private val videoQueue = ArrayBlockingQueue<VideoFrame>(90)
+    private val audioQueue = ArrayBlockingQueue<AudioChunk>(96)
+    private var pendingAudioChunk: AudioChunk? = null
+
+    private val videoBufferPool = ByteBufferPool(maxPooledBuffers = 160)
+    private val audioBufferPool = ByteBufferPool(maxPooledBuffers = 128)
+
+    private var videoDecoder: FFmpegVideoDecoder? = null
+    private var audioDecoder: FFmpegAudioDecoder? = null
+    private val decoderGeneration = AtomicInteger(0)
+    private val isSeekInProgress = AtomicBoolean(false)
+
+    private val info = FFmpegVideoDecoder.readVideoInfo(options.filePath)
+    private val totalDuration = info.duration
+    private val fallbackClock = PlaybackClock()
+
     private var paused = false
     private var playbackSpeed = 1.0
     private var currentTime = 0.0
-    private var totalDuration = H264Decoder.getVideoDuration(filePath)
+    private var lastFrameTimestamp = -1.0
     private var showFps = false
 
-    // Переменные для работы с декодером и seek
-    private var decoder: H264Decoder? = null
-    private var decoderStartTime = 0.0  // время, с которого запущен текущий декодер
-    private val isSeekInProgress = AtomicBoolean(false)
-    private var lastFrameTimestamp = -1.0
-
-    // FPS
     private var fps = 0.0
     private var frameCount = 0
     private var fpsTimer = 0.0
+    private var lastLoopTime = System.nanoTime() / 1_000_000_000.0
+    private val keyState = HashMap<Int, Boolean>()
 
-    // Тайминг рендеринга
-    private var lastTime = System.nanoTime() / 1_000_000_000.0
-
-    // Параметры таймлайна
     private var timelineVisible = true
     private var timelineLastInteraction = 0.0
-    private val timelineTimeout = 3.0  // секунд
+    private val timelineTimeout = 3.0
     private var timelineMouseWasPressed = false
 
-    // Размеры видео
-    private var videoWidth = 0
-    private var videoHeight = 0
-
-    // Защита от частых перемоток
-    private var lastSeekTime = 0.0
-    private val seekCooldown = 0.5  // минимальное время между перемотками (секунды)
-
-    // Флаг для проверки состояния декодера
-    private var decoderRunning = false
-
     fun run() {
+        Log.info("Starting player")
+        Log.info("Video: ${options.filePath}")
+        Log.info(
+            "Info: ${info.width}x${info.height}, duration=%.3fs, videoStream=%d, audioStream=%d".format(
+                info.duration,
+                info.videoStreamIndex,
+                info.audioStreamIndex
+            )
+        )
+        Log.info("Cache: enabled=${options.cacheEnabled}, dir=${options.cacheDir.toAbsolutePath()}, limit=${options.cacheSizeMb}MB")
+        Log.info("Video output mode: ${if (options.nativeYuv) "native YUV shader (experimental)" else "RGB fallback"}")
         initGLFW()
         initOpenGL()
-        decoderStartTime = 0.0
-        startDecoder(decoderStartTime)
+        initCache()
+        initAudio()
+        startDecoders(0.0)
+        preloadFirstFrame()
+        fallbackClock.reset(0.0, paused, playbackSpeed)
+        currentTime = 0.0
         loop()
         cleanup()
     }
 
     private fun initGLFW() {
         if (!glfwInit()) throw RuntimeException("Failed to initialize GLFW")
-        window = glfwCreateWindow(1280, 720, "H.264 Video Player", NULL, NULL)
+        window = glfwCreateWindow(1280, 720, "Direct FFmpeg Player", NULL, NULL)
         if (window == NULL) throw RuntimeException("Failed to create window")
         glfwMakeContextCurrent(window)
         glfwSwapInterval(1)
@@ -74,142 +131,321 @@ class VideoPlayer(private val filePath: String) {
     }
 
     private fun initOpenGL() {
-        textureID = glGenTextures()
-        glBindTexture(GL_TEXTURE_2D, textureID)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-        glBindTexture(GL_TEXTURE_2D, 0)
+        renderer.initialize()
     }
 
-    // Запускаем декодер с указанным стартовым временем (в секундах)
-    private fun startDecoder(seekTime: Double) {
-        try {
-            decoder = H264Decoder(filePath, seekTime).also { decoder ->
-                decoder.setFrameCallback { frame ->
-                    frameQueue.add(frame)
-                    // Сохраняем размеры видео из первого кадра, если они ещё не установлены
-                    if (videoWidth == 0 || videoHeight == 0) {
-                        videoWidth = frame.width
-                        videoHeight = frame.height
-                    }
-                    // Обновляем последний временной штамп кадра
-                    lastFrameTimestamp = frame.timestamp
-                }
-                decoder.startAsync()
-                decoderRunning = true
+    private fun initCache() {
+        if (!options.cacheEnabled) return
+        segmentCache = VideoSegmentCache(
+            cacheDir = options.cacheDir,
+            maxSizeBytes = options.cacheSizeMb * 1024L * 1024L
+        )
+        segmentIndex = try {
+            segmentCache?.loadOrBuild(options.filePath)?.also {
+                Log.info("Segment cache ready: ${it.segments.size} keyframe segments")
             }
         } catch (e: Exception) {
-            println("Ошибка запуска декодера: ${e.message}")
-            decoderRunning = false
+            Log.error("Segment cache disabled for this run: ${e.message}", e)
+            null
         }
     }
 
-    // Перезапуск декодера для seek с обработкой ошибок
-    private fun restartDecoder(seekTime: Double) {
-        if (isSeekInProgress.getAndSet(true)) {
-            return // Пропускаем, если перемотка уже в процессе
+    private fun initAudio() {
+        if (!info.hasAudio) return
+        audioDevice = try {
+            OpenALAudioDevice().also {
+                it.initialize(options.audioDevice)
+                Log.info("OpenAL audio initialized")
+            }
+        } catch (e: Exception) {
+            Log.error("Audio disabled: ${e.message}", e)
+            null
         }
+    }
 
-        // Обновляем текущее время сразу для более отзывчивого UI
-        currentTime = seekTime
+    private fun startDecoders(seekTime: Double) {
+        val generation = decoderGeneration.incrementAndGet()
+        lastFrameTimestamp = seekTime
+        Log.info("Starting decoders at %.3fs (generation %d)".format(seekTime, generation))
 
-        Thread {
-            try {
-                println("Перезапуск декодера с позиции: $seekTime сек")
-
-                // Полная остановка текущего декодера
-                val currentDecoder = decoder
-                if (currentDecoder != null && decoderRunning) {
-                    try {
-                        currentDecoder.stop()
-                        // Ожидаем завершения с таймаутом
-                        val joinSuccess = currentDecoder.join() // Ждем завершения не более 1 секунды
-                    } catch (e: Exception) {
-                        println("Ошибка при остановке декодера: ${e.message}")
+        videoDecoder = FFmpegVideoDecoder(
+            filePath = options.filePath,
+            startTime = seekTime,
+            listener = object : DecoderListener {
+                override fun onFrameDecoded(frame: VideoFrame) {
+                    if (generation != decoderGeneration.get()) {
+                        frame.close()
+                        return
                     }
+                    offerVideoFrame(frame, generation)
                 }
 
-                // Очистка всех ресурсов
-                frameQueue.clear()
-                decoderStartTime = seekTime
-                decoderRunning = false
+                override fun onDecodingFinished() = Unit
 
-                // Небольшая пауза перед созданием нового декодера для стабильности
-                safeSleep(50)
+                override fun onDecodingError(error: Exception) {
+                    Log.error("Video decode error: ${error.message}", error)
+                }
+            },
+            bufferPool = videoBufferPool,
+            nativeYuv = options.nativeYuv
+        ).also { it.startAsync() }
 
-                // Запуск нового декодера с указанной позиции
-                startDecoder(seekTime)
+        if (info.hasAudio && audioDevice != null) {
+            audioDecoder = FFmpegAudioDecoder(
+                filePath = options.filePath,
+                startTime = seekTime,
+                listener = object : AudioDecoderListener {
+                    override fun onAudioDecoded(chunk: AudioChunk) {
+                    if (generation != decoderGeneration.get()) {
+                        chunk.close()
+                        return
+                    }
+                    offerAudioChunk(chunk, generation)
+                }
 
+                override fun onAudioFinished() = Unit
+
+                override fun onAudioError(error: Exception) {
+                    Log.error("Audio decode error: ${error.message}", error)
+                }
+            },
+                bufferPool = audioBufferPool
+            ).also { it.startAsync() }
+        }
+
+        segmentIndex?.let { segmentCache?.prefetchAround(it, seekTime) }
+    }
+
+    private fun preloadFirstFrame(timeoutMillis: Long = 5_000) {
+        val deadline = System.nanoTime() + timeoutMillis * 1_000_000L
+        Log.info("Waiting for first decoded video frame")
+        while (System.nanoTime() < deadline) {
+            val frame = videoQueue.poll(25, TimeUnit.MILLISECONDS)
+            if (frame != null) {
+                currentTime = frame.timestamp
+                lastFrameTimestamp = frame.timestamp
+                renderer.upload(frame)
+                Log.info("First video frame ready at %.3fs".format(currentTime))
+                return
+            }
+        }
+        Log.info("First video frame was not ready after ${timeoutMillis}ms; starting playback anyway")
+    }
+
+    private fun stopDecoders() {
+        Log.info("Stopping decoders")
+        videoDecoder?.stop()
+        audioDecoder?.stop()
+        videoDecoder?.join()
+        audioDecoder?.join()
+        videoDecoder = null
+        audioDecoder = null
+    }
+
+    private fun offerVideoFrame(frame: VideoFrame, generation: Int) {
+        var offered = false
+        try {
+            while (generation == decoderGeneration.get()) {
+                if (videoQueue.offer(frame, 25, TimeUnit.MILLISECONDS)) {
+                    offered = true
+                    return
+                }
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } finally {
+            if (!offered) {
+                frame.close()
+            }
+        }
+    }
+
+    private fun offerAudioChunk(chunk: AudioChunk, generation: Int) {
+        var offered = false
+        try {
+            while (generation == decoderGeneration.get()) {
+                if (audioQueue.offer(chunk, 25, TimeUnit.MILLISECONDS)) {
+                    offered = true
+                    return
+                }
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } finally {
+            if (!offered) {
+                chunk.close()
+            }
+        }
+    }
+
+    private fun requestSeek(targetTime: Double) {
+        if (isSeekInProgress.getAndSet(true)) return
+        val clamped = targetTime.coerceIn(0.0, totalDuration.takeIf { it > 0.0 } ?: targetTime)
+        currentTime = clamped
+        fallbackClock.reset(clamped, paused, playbackSpeed)
+        decoderGeneration.incrementAndGet()
+        Log.info("Seek requested: %.3fs".format(clamped))
+        audioDevice?.clear(clamped)
+        closeQueuedFrames()
+        closeQueuedAudio()
+        pendingAudioChunk?.close()
+        pendingAudioChunk = null
+
+        Thread({
+            try {
+                stopDecoders()
+                startDecoders(clamped)
             } catch (e: Exception) {
-                println("Ошибка при перезапуске декодера: ${e.message}")
+                Log.error("Seek failed: ${e.message}", e)
             } finally {
                 isSeekInProgress.set(false)
             }
-        }.start()
+        }, "seek-restart").start()
     }
 
-    // Обновление текстуры – вызывается в главном OpenGL потоке
-    private fun updateTexture(frame: Frame) {
-        try {
-            glBindTexture(GL_TEXTURE_2D, textureID)
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, frame.width, frame.height, 0, GL_RGB, GL_UNSIGNED_BYTE, frame.buffer)
-            glBindTexture(GL_TEXTURE_2D, 0)
-        } catch (e: Exception) {
-            println("Ошибка обновления текстуры: ${e.message}")
-        }
-    }
+    private fun loop() {
+        var noFramesCounter = 0.0
 
-    // Обработка клавиатурного и мышиного ввода с защитой от частых нажатий
-    private fun processInput(deltaTime: Double, currentLoopTime: Double) {
-        if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) {
-            paused = !paused
-            safeSleep(150)
-        }
-        if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS && !isSeekInProgress.get()) {
-            val newTime = currentTime + 10.0
-            if (newTime < totalDuration) {
-                restartDecoder(newTime)
+        while (!glfwWindowShouldClose(window)) {
+            val loopTime = System.nanoTime() / 1_000_000_000.0
+            val deltaTime = loopTime - lastLoopTime
+            lastLoopTime = loopTime
+
+            processInput(loopTime)
+            pumpAudio()
+            updateClock(loopTime)
+            updateFps(deltaTime)
+
+            if (loopTime - timelineLastInteraction > timelineTimeout) {
+                timelineVisible = false
             }
-            safeSleep(150)
+
+            val frameUpdated = uploadDueFrames()
+            renderer.render()
+            renderOverlay()
+
+            glfwSwapBuffers(window)
+            glfwPollEvents()
+
+            if (!paused && !isSeekInProgress.get() && videoQueue.isEmpty() && currentTime < totalDuration - 1.0) {
+                noFramesCounter += deltaTime
+                if (noFramesCounter > 4.0) {
+                    Log.info("Decoder stalled; restarting near %.2f seconds".format(currentTime))
+                    requestSeek(currentTime)
+                    noFramesCounter = 0.0
+                }
+            } else {
+                noFramesCounter = 0.0
+            }
+
+            if (totalDuration > 0.0 && currentTime >= totalDuration) {
+                setPaused(true)
+            }
+
+            if (!frameUpdated) {
+                sleepQuietly(2)
+            }
         }
-        if (glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS && !isSeekInProgress.get()) {
-            val newTime = currentTime - 10.0
-            val targetTime = if (newTime < 0) 0.0 else newTime
-            restartDecoder(targetTime)
-            safeSleep(150)
+    }
+
+    private fun pumpAudio() {
+        val device = audioDevice ?: return
+        device.pump()
+
+        pendingAudioChunk?.let { pending ->
+            if (device.queue(pending)) {
+                pendingAudioChunk = null
+            } else {
+                return
+            }
         }
-        if (glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS) {
-            playbackSpeed += 0.25
-            safeSleep(150)
+
+        while (true) {
+            val chunk = audioQueue.poll() ?: break
+            if (!device.queue(chunk)) {
+                pendingAudioChunk = chunk
+                break
+            }
         }
-        if (glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS) {
-            playbackSpeed -= 0.25
-            if (playbackSpeed < 0.25) playbackSpeed = 0.25
-            safeSleep(150)
+    }
+
+    private fun updateClock(loopTime: Double) {
+        currentTime = if (!paused && audioDevice != null && info.hasAudio) {
+            audioDevice?.clockSeconds(currentTime) ?: fallbackClock.seconds(loopTime)
+        } else {
+            fallbackClock.seconds(loopTime)
         }
-        if (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS) {
+        segmentIndex?.let { segmentCache?.prefetchAround(it, currentTime) }
+    }
+
+    private fun uploadDueFrames(): Boolean {
+        var uploaded = false
+        while (true) {
+            val frame = videoQueue.peek() ?: break
+            if (frame.timestamp > currentTime + 0.025) break
+            val due = videoQueue.poll() ?: break
+            lastFrameTimestamp = due.timestamp
+            renderer.upload(due)
+            uploaded = true
+        }
+        return uploaded
+    }
+
+    private fun updateFps(deltaTime: Double) {
+        frameCount++
+        fpsTimer += deltaTime
+        if (fpsTimer >= 1.0) {
+            fps = frameCount / fpsTimer
+            frameCount = 0
+            fpsTimer = 0.0
+        }
+    }
+
+    private fun processInput(currentLoopTime: Double) {
+        if (pressedOnce(GLFW_KEY_SPACE)) {
+            setPaused(!paused)
+        }
+        if (pressedOnce(GLFW_KEY_RIGHT)) {
+            requestSeek(currentTime + 10.0)
+        }
+        if (pressedOnce(GLFW_KEY_LEFT)) {
+            requestSeek(max(0.0, currentTime - 10.0))
+        }
+        if (pressedOnce(GLFW_KEY_UP)) {
+            setPlaybackSpeed(playbackSpeed + 0.25)
+        }
+        if (pressedOnce(GLFW_KEY_DOWN)) {
+            setPlaybackSpeed(max(0.25, playbackSpeed - 0.25))
+        }
+        if (pressedOnce(GLFW_KEY_F)) {
             showFps = !showFps
-            safeSleep(150)
         }
-        if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS && !isSeekInProgress.get()) {
-            // Перезапуск видео с начала
-            restartDecoder(0.0)
-            safeSleep(150)
+        if (pressedOnce(GLFW_KEY_R)) {
+            requestSeek(0.0)
         }
         processMouseInput(currentLoopTime)
     }
 
-    // Безопасный сон потока
-    private fun safeSleep(milliseconds: Long) {
-        try {
-            Thread.sleep(milliseconds)
-        } catch (e: InterruptedException) {
-            // Игнорируем прерывание
-        }
+    private fun pressedOnce(key: Int): Boolean {
+        val down = glfwGetKey(window, key) == GLFW_PRESS
+        val wasDown = keyState[key] == true
+        keyState[key] = down
+        return down && !wasDown
     }
 
-    // Обработка мышиного ввода для таймлайна с защитой от частых изменений
-    // Обработка мышиного ввода для таймлайна - полная перегенерация при клике
+    private fun setPaused(value: Boolean) {
+        if (paused == value) return
+        paused = value
+        fallbackClock.reset(currentTime, paused, playbackSpeed)
+        audioDevice?.setPaused(paused)
+    }
+
+    private fun setPlaybackSpeed(value: Double) {
+        playbackSpeed = value.coerceAtLeast(0.25)
+        fallbackClock.reset(currentTime, paused, playbackSpeed)
+        audioDevice?.setPitch(playbackSpeed)
+    }
+
     private fun processMouseInput(currentLoopTime: Double) {
         val timelineX = 50.0
         val timelineY = 650.0
@@ -223,135 +459,23 @@ class VideoPlayer(private val filePath: String) {
         val mouseY = yPosBuffer.get(0)
 
         val mouseInTimeline = mouseX in timelineX..(timelineX + timelineWidth) &&
-                mouseY in timelineY..(timelineY + timelineHeight)
+            mouseY in timelineY..(timelineY + timelineHeight)
 
         if (mouseInTimeline) {
             timelineVisible = true
             timelineLastInteraction = currentLoopTime
 
             val mousePressed = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS
-
-            // Вызываем переход только при переходе из "не нажато" в "нажато" и если нет перемотки в процессе
             if (mousePressed && !timelineMouseWasPressed && !isSeekInProgress.get()) {
                 val newSeekTime = ((mouseX - timelineX) / timelineWidth) * totalDuration
-
-                if (newSeekTime >= 0 && newSeekTime <= totalDuration) {
-                    currentTime = newSeekTime  // Устанавливаем новое время сразу
-                    restartDecoder(newSeekTime)
-                }
+                requestSeek(newSeekTime)
             }
             timelineMouseWasPressed = mousePressed
         } else {
-            // Если курсор вне области, сбрасываем флаг
             timelineMouseWasPressed = false
         }
     }
 
-    private fun loop() {
-        var lastCheckTime = System.nanoTime() / 1_000_000_000.0
-        var noFramesCounter = 0.0
-
-        while (!glfwWindowShouldClose(window)) {
-            val currentLoopTime = System.nanoTime() / 1_000_000_000.0
-            val deltaTime = currentLoopTime - lastTime
-            lastTime = currentLoopTime
-
-            processInput(deltaTime, currentLoopTime)
-
-            // Проверка на "зависание" декодера
-            if (!isSeekInProgress.get() && !paused && frameQueue.isEmpty()) {
-                noFramesCounter += deltaTime
-                if (noFramesCounter > 2.0) { // Если нет кадров более 2 секунд
-                    println("Обнаружено зависание декодера, перезапуск...")
-                    restartDecoder(currentTime)
-                    noFramesCounter = 0.0
-                }
-            } else {
-                noFramesCounter = 0.0
-            }
-
-            // Проверка состояния декодера каждые 5 секунд
-            if (currentLoopTime - lastCheckTime > 5.0) {
-                checkDecoderState()
-                lastCheckTime = currentLoopTime
-            }
-
-            if (!paused && !isSeekInProgress.get()) {
-                currentTime += deltaTime * playbackSpeed
-            }
-
-            // Обновление FPS
-            frameCount++
-            fpsTimer += deltaTime
-            if (fpsTimer >= 1.0) {
-                fps = frameCount / fpsTimer
-                frameCount = 0
-                fpsTimer = 0.0
-            }
-
-            // Скрываем таймлайн, если нет активности более timelineTimeout секунд
-            if (currentLoopTime - timelineLastInteraction > timelineTimeout) {
-                timelineVisible = false
-            }
-
-            glClear(GL_COLOR_BUFFER_BIT)
-
-            // Обновляем текстуру, если найдены кадры с timestamp <= currentTime
-            var frameUpdated = false
-            try {
-                while (frameQueue.isNotEmpty() && frameQueue.peek().timestamp <= currentTime) {
-                    val frame = frameQueue.poll()
-                    updateTexture(frame)
-                    frameUpdated = true
-                }
-            } catch (e: Exception) {
-                println("Ошибка при обработке кадров: ${e.message}")
-            }
-
-            renderFrame()
-            renderOverlay()
-
-            glfwSwapBuffers(window)
-            glfwPollEvents()
-
-            if (currentTime >= totalDuration) {
-                paused = true
-            }
-
-            // Небольшая задержка для снижения нагрузки на CPU
-            if (!frameUpdated) {
-                safeSleep(5)
-            }
-        }
-    }
-
-    // Проверка состояния декодера и его перезапуск при необходимости
-    private fun checkDecoderState() {
-        if (!isSeekInProgress.get() && (decoder == null || !decoderRunning)) {
-            println("Декодер не работает, перезапуск...")
-            restartDecoder(currentTime)
-        } else if (!isSeekInProgress.get() && !paused && lastFrameTimestamp >= 0 &&
-            currentTime - lastFrameTimestamp > 5.0 && currentTime < totalDuration - 1.0) {
-            // Если текущее время значительно опережает последний декодированный кадр
-            println("Декодер отстает, перезапуск...")
-            restartDecoder(currentTime)
-        }
-    }
-
-    private fun renderFrame() {
-        glEnable(GL_TEXTURE_2D)
-        glBindTexture(GL_TEXTURE_2D, textureID)
-        glBegin(GL_QUADS)
-        glTexCoord2f(0f, 1f); glVertex2f(-1f, -1f)
-        glTexCoord2f(1f, 1f); glVertex2f(1f, -1f)
-        glTexCoord2f(1f, 0f); glVertex2f(1f, 1f)
-        glTexCoord2f(0f, 0f); glVertex2f(-1f, 1f)
-        glEnd()
-        glBindTexture(GL_TEXTURE_2D, 0)
-        glDisable(GL_TEXTURE_2D)
-    }
-
-    // Отрисовка оверлея: текст и таймлайн (если видим)
     private fun renderOverlay() {
         glMatrixMode(GL_PROJECTION)
         glPushMatrix()
@@ -361,11 +485,23 @@ class VideoPlayer(private val filePath: String) {
         glPushMatrix()
         glLoadIdentity()
 
-        val timeText = String.format("time: %.2f / %.2f сек", currentTime, totalDuration)
-        val speedText = String.format("speed: %.2fx", playbackSpeed)
-        val statusText = if (isSeekInProgress.get()) "rewinding..." else if (paused) "pause" else "reproduction"
-        val fpsText = if (showFps) String.format("FPS: %.2f", fps) else ""
-        val overlayText = "$timeText   $speedText   $statusText   $fpsText"
+        val cacheText = if (options.cacheEnabled && segmentIndex != null) "cache:on" else "cache:off"
+        val audioText = if (audioDevice != null && info.hasAudio) "audio:on" else "audio:off"
+        val statusText = when {
+            isSeekInProgress.get() -> "seeking"
+            paused -> "paused"
+            else -> "playing"
+        }
+        val fpsText = if (showFps) " FPS: %.2f".format(fps) else ""
+        val overlayText = "time: %.2f / %.2f sec   speed: %.2fx   %s   %s   %s%s".format(
+            currentTime,
+            totalDuration,
+            playbackSpeed,
+            statusText,
+            audioText,
+            cacheText,
+            fpsText
+        )
         drawText(overlayText, 10f, 30f)
 
         if (timelineVisible) {
@@ -378,14 +514,12 @@ class VideoPlayer(private val filePath: String) {
         glMatrixMode(GL_MODELVIEW)
     }
 
-    // Отрисовка таймлайна (фон и прогресс)
     private fun renderTimeline() {
         val timelineX = 50.0
         val timelineY = 650.0
         val timelineWidth = 1180.0
         val timelineHeight = 20.0
 
-        // Фон (серый прямоугольник)
         glColor3f(0.3f, 0.3f, 0.3f)
         glBegin(GL_QUADS)
         glVertex2d(timelineX, timelineY)
@@ -394,9 +528,8 @@ class VideoPlayer(private val filePath: String) {
         glVertex2d(timelineX, timelineY + timelineHeight)
         glEnd()
 
-        // Прогресс (зелёный прямоугольник)
-        val progressRatio = currentTime / totalDuration
-        val progressWidth = timelineWidth * if (progressRatio <= 1.0) progressRatio else 1.0
+        val progressRatio = if (totalDuration > 0.0) currentTime / totalDuration else 0.0
+        val progressWidth = timelineWidth * min(1.0, max(0.0, progressRatio))
         glColor3f(0.1f, 0.8f, 0.1f)
         glBegin(GL_QUADS)
         glVertex2d(timelineX, timelineY)
@@ -405,9 +538,8 @@ class VideoPlayer(private val filePath: String) {
         glVertex2d(timelineX, timelineY + timelineHeight)
         glEnd()
 
-        // Индикатор перемотки (если активен)
         if (isSeekInProgress.get()) {
-            glColor3f(1.0f, 0.5f, 0.0f) // Оранжевый цвет для индикатора перемотки
+            glColor3f(1.0f, 0.5f, 0.0f)
             val loadingBarWidth = 5.0
             glBegin(GL_QUADS)
             glVertex2d(timelineX + progressWidth - loadingBarWidth, timelineY - 5)
@@ -420,9 +552,8 @@ class VideoPlayer(private val filePath: String) {
         glColor3f(1f, 1f, 1f)
     }
 
-    // Отрисовка текста с помощью STB Easy Font с защитой от ошибок
     private fun drawText(text: String, x: Float, y: Float) {
-        val charBuffer = BufferUtils.createByteBuffer(99999)
+        val charBuffer = BufferUtils.createByteBuffer(99_999)
         val quads = STBEasyFont.stb_easy_font_print(x, y, text, null, charBuffer)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
@@ -434,22 +565,65 @@ class VideoPlayer(private val filePath: String) {
         glDisable(GL_BLEND)
     }
 
+    private fun closeQueuedFrames() {
+        while (true) {
+            videoQueue.poll()?.close() ?: break
+        }
+    }
+
+    private fun closeQueuedAudio() {
+        while (true) {
+            audioQueue.poll()?.close() ?: break
+        }
+    }
+
     private fun cleanup() {
         try {
-            isSeekInProgress.set(true) // Предотвращаем новые перемотки
-            decoder?.stop()
-            decoder?.join() // Ждем завершения не более 1 секунды
-
-            if (textureID != 0) {
-                glDeleteTextures(textureID)
-            }
+            isSeekInProgress.set(true)
+            decoderGeneration.incrementAndGet()
+            stopDecoders()
+            closeQueuedFrames()
+            closeQueuedAudio()
+            pendingAudioChunk?.close()
+            pendingAudioChunk = null
+            segmentCache?.close()
+            audioDevice?.close()
+            renderer.close()
 
             if (window != NULL) {
                 glfwDestroyWindow(window)
             }
             glfwTerminate()
         } catch (e: Exception) {
-            println("Ошибка при завершении приложения: ${e.message}")
+            Log.error("Cleanup error: ${e.message}", e)
+        }
+    }
+
+    private fun sleepQuietly(milliseconds: Long) {
+        try {
+            Thread.sleep(milliseconds)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    private class PlaybackClock {
+        private var baseSeconds = 0.0
+        private var baseNano = System.nanoTime()
+        private var paused = false
+        private var speed = 1.0
+
+        fun reset(positionSeconds: Double, paused: Boolean, speed: Double) {
+            baseSeconds = positionSeconds
+            baseNano = System.nanoTime()
+            this.paused = paused
+            this.speed = speed
+        }
+
+        fun seconds(loopTimeSeconds: Double): Double {
+            if (paused) return baseSeconds
+            val elapsed = loopTimeSeconds - baseNano / 1_000_000_000.0
+            return baseSeconds + elapsed * speed
         }
     }
 }

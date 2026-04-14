@@ -1,6 +1,7 @@
 package main
 
-fun main(arg: Array<String>) {
-    val player = VideoPlayer(arg[0])
+fun main(args: Array<String>) {
+    val options = parsePlayerOptions(args) ?: return
+    val player = VideoPlayer(options)
     player.run()
 }
