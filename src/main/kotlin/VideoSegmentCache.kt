@@ -14,6 +14,7 @@ import java.security.MessageDigest
 import java.util.Properties
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.absolute
 import kotlin.io.path.exists
 import kotlin.io.path.inputStream
@@ -33,21 +34,56 @@ data class SegmentIndex(
     val segments: List<Segment>
 ) {
     fun findSegmentStart(timeSeconds: Double): Double {
-        if (segments.isEmpty()) return 0.0
-        var result = segments.first().startSeconds
-        for (segment in segments) {
-            if (segment.startSeconds <= timeSeconds) {
-                result = segment.startSeconds
-            } else {
-                break
-            }
-        }
-        return result.coerceAtLeast(0.0)
+        return findSegment(timeSeconds)?.startSeconds?.coerceAtLeast(0.0) ?: 0.0
     }
 
     fun nextSegmentStart(timeSeconds: Double): Double? {
         return segments.firstOrNull { it.startSeconds > timeSeconds }?.startSeconds
     }
+
+    fun findSegment(timeSeconds: Double): Segment? {
+        if (segments.isEmpty()) return null
+        return segments[findSegmentIndex(timeSeconds)]
+    }
+
+    fun hotWindow(timeSeconds: Double, maxSegments: Int = DEFAULT_HOT_SEGMENTS): List<Segment> {
+        if (segments.isEmpty() || maxSegments <= 0) return emptyList()
+        val startIndex = findSegmentIndex(timeSeconds)
+        val endIndex = minOf(segments.size, startIndex + maxSegments)
+        return segments.subList(startIndex, endIndex)
+    }
+
+    private fun findSegmentIndex(timeSeconds: Double): Int {
+        var low = 0
+        var high = segments.lastIndex
+        var result = 0
+        while (low <= high) {
+            val mid = (low + high) ushr 1
+            if (segments[mid].startSeconds <= timeSeconds) {
+                result = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+        return result
+    }
+
+    companion object {
+        const val DEFAULT_HOT_SEGMENTS = 3
+    }
+}
+
+data class SegmentHotWindow(
+    val key: SegmentCacheKey,
+    val generation: Int,
+    val targetSeconds: Double,
+    val segments: List<Segment>,
+    val updatedNanos: Long = System.nanoTime()
+) {
+    val current: Segment? get() = segments.getOrNull(0)
+    val next: Segment? get() = segments.getOrNull(1)
+    val afterNext: Segment? get() = segments.getOrNull(2)
 }
 
 data class SegmentCacheKey(
@@ -112,7 +148,11 @@ class VideoSegmentCache(
     private val cacheDir: Path,
     private val maxSizeBytes: Long
 ) {
+    private val maxHotWindows = 4
     private val ramIndex = ConcurrentHashMap<String, SegmentIndex>()
+    private val hotWindows = ConcurrentHashMap<String, SegmentHotWindow>()
+    private val pendingWindows = ConcurrentHashMap<String, PendingHotWindow>()
+    private val prefetchGeneration = AtomicInteger(0)
     private val prefetchExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "segment-cache-prefetch").apply { isDaemon = true }
     }
@@ -155,18 +195,55 @@ class VideoSegmentCache(
         return built
     }
 
-    fun prefetchAround(index: SegmentIndex, timeSeconds: Double) {
+    fun prefetchAround(index: SegmentIndex, timeSeconds: Double, generation: Int) {
+        val windowSegments = index.hotWindow(timeSeconds)
+        val currentStart = windowSegments.firstOrNull()?.startSeconds ?: return
+        val key = index.key.contentHash
+        val currentWindow = hotWindows[key]
+        if (currentWindow?.generation == generation &&
+            currentWindow.current?.startSeconds == currentStart
+        ) {
+            return
+        }
+
+        val pending = PendingHotWindow(currentStart, generation)
+        if (pendingWindows[key] == pending) return
+        pendingWindows[key] = pending
+        prefetchGeneration.set(generation)
+
         prefetchExecutor.execute {
-            val start = index.findSegmentStart(timeSeconds)
-            val next = index.nextSegmentStart(start)
-            ramIndex[index.key.contentHash] = index
-            if (next != null) {
-                ramIndex["${index.key.contentHash}:next"] = index
+            try {
+                if (generation != prefetchGeneration.get()) return@execute
+                val window = SegmentHotWindow(
+                    key = index.key,
+                    generation = generation,
+                    targetSeconds = timeSeconds,
+                    segments = windowSegments
+                )
+                ramIndex[key] = index
+                hotWindows[key] = window
+                pruneHotWindows()
+                Log.info(
+                    "Segment hot window: target=%.3fs, generation=%d, segments=%s".format(
+                        timeSeconds,
+                        generation,
+                        window.segments.joinToString(prefix = "[", postfix = "]") {
+                            "%.3fs".format(it.startSeconds)
+                        }
+                    )
+                )
+            } finally {
+                pendingWindows.remove(key, pending)
             }
         }
     }
 
+    fun hotWindowFor(index: SegmentIndex): SegmentHotWindow? {
+        return hotWindows[index.key.contentHash]
+    }
+
     fun close() {
+        prefetchGeneration.incrementAndGet()
         prefetchExecutor.shutdownNow()
     }
 
@@ -280,9 +357,23 @@ class VideoSegmentCache(
         }
     }
 
+    private fun pruneHotWindows() {
+        if (hotWindows.size <= maxHotWindows) return
+        val keep = hotWindows.values
+            .sortedByDescending { it.updatedNanos }
+            .take(maxHotWindows)
+            .mapTo(mutableSetOf()) { it.key.contentHash }
+        hotWindows.keys.removeIf { it !in keep }
+    }
+
     private data class CacheEntry(
         val path: Path,
         val sizeBytes: Long,
         val modifiedMillis: Long
+    )
+
+    private data class PendingHotWindow(
+        val startSeconds: Double,
+        val generation: Int
     )
 }

@@ -42,7 +42,7 @@ kotlin {
 
 tasks.shadowJar {
     archiveBaseName.set("decoder")
-    archiveVersion.set("1.0.0")
+    archiveVersion.set("1.1.0")
     archiveClassifier.set("")
     mergeServiceFiles()
 

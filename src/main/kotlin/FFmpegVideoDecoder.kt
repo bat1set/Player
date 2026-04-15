@@ -483,5 +483,3 @@ class FFmpegVideoDecoder(
         }
     }
 }
-
-typealias H264Decoder = FFmpegVideoDecoder

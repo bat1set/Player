@@ -234,7 +234,7 @@ class VideoPlayer(private val options: PlayerOptions) {
             ).also { it.startAsync() }
         }
 
-        segmentIndex?.let { segmentCache?.prefetchAround(it, seekTime) }
+        segmentIndex?.let { segmentCache?.prefetchAround(it, seekTime, generation) }
     }
 
     private fun preloadFirstFrame(timeoutMillis: Long = 5_000) {
@@ -417,7 +417,7 @@ class VideoPlayer(private val options: PlayerOptions) {
             fallbackClock.seconds(loopTime)
         }
         lastAvDrift = lastFrameTimestamp - currentTime
-        segmentIndex?.let { segmentCache?.prefetchAround(it, currentTime) }
+        segmentIndex?.let { segmentCache?.prefetchAround(it, currentTime, decoderGeneration.get()) }
     }
 
     private fun uploadDueFrames(): Boolean {

@@ -31,6 +31,28 @@ class PlayerCoreTest {
     }
 
     @Test
+    fun segmentHotWindowStartsAtCurrentKeyframe() {
+        val key = SegmentCacheKey("video.mp4", 1, 2, "abcdef")
+        val index = SegmentIndex(
+            key = key,
+            duration = 50.0,
+            segments = listOf(
+                Segment(0.0, 0),
+                Segment(5.0, 50),
+                Segment(10.0, 100),
+                Segment(20.0, 200),
+                Segment(40.0, 400)
+            )
+        )
+
+        val middle = index.hotWindow(12.0)
+        assertEquals(listOf(10.0, 20.0, 40.0), middle.map { it.startSeconds })
+
+        val tail = index.hotWindow(41.0)
+        assertEquals(listOf(40.0), tail.map { it.startSeconds })
+    }
+
+    @Test
     fun cacheKeyChangesWhenFileChanges() {
         val dir = Files.createTempDirectory("player-cache-key-test")
         val file = dir.resolve("sample.bin")
