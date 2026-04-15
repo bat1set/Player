@@ -23,13 +23,13 @@ Player - видеоплеер на Kotlin/JVM с direct FFmpeg backend, OpenGL-r
 Fat jar будет создан здесь:
 
 ```text
-build\libs\decoder-1.0.0.jar
+build\libs\decoder-1.1.0.jar
 ```
 
 ## Запуск
 
 ```powershell
-java -jar build\libs\decoder-1.0.0.jar "C:\path\to\video.mp4"
+java -jar build\libs\decoder-1.1.0.jar "C:\path\to\video.mp4"
 ```
 
 Опции:
