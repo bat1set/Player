@@ -30,8 +30,11 @@ import org.lwjgl.opengl.GL11.GL_MODELVIEW
 import org.lwjgl.opengl.GL11.GL_ONE_MINUS_SRC_ALPHA
 import org.lwjgl.opengl.GL11.GL_PROJECTION
 import org.lwjgl.opengl.GL11.GL_QUADS
+import org.lwjgl.opengl.GL11.GL_RENDERER
 import org.lwjgl.opengl.GL11.GL_SRC_ALPHA
 import org.lwjgl.opengl.GL11.GL_VERTEX_ARRAY
+import org.lwjgl.opengl.GL11.GL_VENDOR
+import org.lwjgl.opengl.GL11.GL_VERSION
 import org.lwjgl.opengl.GL11.glBegin
 import org.lwjgl.opengl.GL11.glBlendFunc
 import org.lwjgl.opengl.GL11.glColor3f
@@ -46,6 +49,7 @@ import org.lwjgl.opengl.GL11.glMatrixMode
 import org.lwjgl.opengl.GL11.glOrtho
 import org.lwjgl.opengl.GL11.glPopMatrix
 import org.lwjgl.opengl.GL11.glPushMatrix
+import org.lwjgl.opengl.GL11.glGetString
 import org.lwjgl.opengl.GL11.glVertex2d
 import org.lwjgl.opengl.GL11.glVertexPointer
 import org.lwjgl.stb.STBEasyFont
@@ -60,7 +64,7 @@ import kotlin.math.min
 
 class VideoPlayer(private val options: PlayerOptions) {
     private var window: Long = NULL
-    private val renderer = VideoFrameRenderer()
+    private val renderer = VideoFrameRenderer(options.debugVideo)
     private var audioDevice: OpenALAudioDevice? = null
     private var segmentCache: VideoSegmentCache? = null
     private var segmentIndex: SegmentIndex? = null
@@ -140,6 +144,12 @@ class VideoPlayer(private val options: PlayerOptions) {
     }
 
     private fun initOpenGL() {
+        if (options.debugVideo) {
+            Log.info(
+                "OpenGL: version=${glGetString(GL_VERSION)}, " +
+                    "renderer=${glGetString(GL_RENDERER)}, vendor=${glGetString(GL_VENDOR)}"
+            )
+        }
         renderer.initialize()
     }
 

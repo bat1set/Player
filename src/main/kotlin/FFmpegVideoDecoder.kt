@@ -283,14 +283,31 @@ class FFmpegVideoDecoder(
         when (frame) {
             is RgbVideoFrame -> Log.info("RGB sample: ${bufferStats(frame.rgb)}")
             is Yuv420pVideoFrame -> {
-                Log.info("Y plane sample: ${bufferStats(frame.y)}")
-                Log.info("U plane sample: ${bufferStats(frame.u)}")
-                Log.info("V plane sample: ${bufferStats(frame.v)}")
+                val y = bufferStats(frame.y)
+                val u = bufferStats(frame.u)
+                val v = bufferStats(frame.v)
+                Log.info("Y plane sample: $y")
+                Log.info("U plane sample: $u")
+                Log.info("V plane sample: $v")
+                logSuspiciousNativeYuvStats(u, v)
             }
             is Nv12VideoFrame -> {
-                Log.info("Y plane sample: ${bufferStats(frame.y)}")
-                Log.info("UV plane sample: ${bufferStats(frame.uv)}")
+                val y = bufferStats(frame.y)
+                val uv = bufferStats(frame.uv)
+                Log.info("Y plane sample: $y")
+                Log.info("UV plane sample: $uv")
+                logSuspiciousNativeYuvStats(uv, uv)
             }
+        }
+    }
+
+    private fun logSuspiciousNativeYuvStats(uStats: String, vStats: String) {
+        if (!nativeYuv) return
+        if (uStats.contains("max=0") || vStats.contains("max=0")) {
+            Log.info(
+                "Native YUV warning: chroma plane sample contains only zero values; " +
+                    "if the frame is green, plane upload/copy is the likely cause."
+            )
         }
     }
 
@@ -319,12 +336,19 @@ class FFmpegVideoDecoder(
         height: Int,
         target: java.nio.ByteBuffer
     ) {
+        val targetSize = width * height
+        val sourceSize = (height - 1) * lineSize + width
         target.clear()
+        target.limit(targetSize)
+        val source = BytePointer(src)
+            .position(0)
+            .capacity(sourceSize.toLong())
+            .asByteBuffer()
         repeat(height) { row ->
             val offset = row * lineSize
-            val rowPtr = BytePointer(src).position(offset.toLong()).capacity((offset + width).toLong())
-            val rowBuffer = rowPtr.asByteBuffer()
-            rowBuffer.limit(width)
+            val rowBuffer = source.duplicate()
+            rowBuffer.position(offset)
+            rowBuffer.limit(offset + width)
             target.put(rowBuffer)
         }
         target.flip()
